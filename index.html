@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>P2Pファイル転送 (WebRTC)</title>
+  <style>
+    body { font-family: sans-serif; max-width: 700px; margin: 20px auto; padding: 0 10px; line-height: 1.5; }
+    textarea { width: 100%; height: 80px; font-family: monospace; }
+    .card { border: 1px solid #ccc; border-radius: 6px; padding: 15px; margin-bottom: 15px; }
+    button { padding: 8px 12px; cursor: pointer; }
+    #status { font-weight: bold; color: #333; }
+  </style>
+</head>
+<body>
+
+  <h1>P2P ファイル送信 (手動シグナリング)</h1>
+  <p id="status">ステータス: 未接続</p>
+
+  <div class="card">
+    <h2>1. 接続設定</h2>
+    <button id="createOfferBtn">【送信側】接続情報(オファー)を作成</button>
+    <br><br>
+    <label>自分の接続情報 (これをコピーして相手に渡す):</label>
+    <textarea id="localSdp" readonly placeholder="ここに接続情報が出力されます"></textarea>
+
+    <label>相手の接続情報 (相手から受け取って貼り付ける):</label>
+    <textarea id="remoteSdp" placeholder="相手のテキストをここに貼り付けてください"></textarea>
+    <br><br>
+    <button id="applyRemoteBtn">接続情報を適用</button>
+  </div>
+
+  <div class="card">
+    <h2>2. ファイル送受信</h2>
+    <input type="file" id="fileInput" disabled>
+    <button id="sendFileBtn" disabled>ファイル送信</button>
+    <br><br>
+    <div id="downloadArea"></div>
+  </div>
+
+  <script>
+    // GoogleのSTUNサーバーを利用して公衆IPアドレスを確認
+    const peerConnection = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+    });
+
+    let dataChannel = null;
+    let receivedBuffers = [];
+    let receivedSize = 0;
+    let fileMetaData = null;
+
+    const localSdpEl = document.getElementById('localSdp');
+    const remoteSdpEl = document.getElementById('remoteSdp');
+    const statusEl = document.getElementById('status');
+    const fileInput = document.getElementById('fileInput');
+    const sendFileBtn = document.getElementById('sendFileBtn');
+    const downloadArea = document.getElementById('downloadArea');
+
+    // データチャネルのイベント設定関数
+    function setupDataChannel(channel) {
+      dataChannel = channel;
+      dataChannel.binaryType = 'arraybuffer';
+
+      dataChannel.onopen = () => {
+        statusEl.innerText = 'ステータス: P2P接続完了！ファイルを送信できます';
+        fileInput.disabled = false;
+        sendFileBtn.disabled = false;
+      };
+
+      dataChannel.onmessage = (event) => {
+        // 文字列が届いた場合はファイル情報(名前とサイズ)
+        if (typeof event.data === 'string') {
+          fileMetaData = JSON.parse(event.data);
+          receivedBuffers = [];
+          receivedSize = 0;
+          statusEl.innerText = `ファイル受信中: ${fileMetaData.name} (${(fileMetaData.size / 1024).toFixed(1)} KB)...`;
+        } else {
+          // バイナリデータが届いた場合は配列に格納
+          receivedBuffers.push(event.data);
+          receivedSize += event.data.byteLength;
+
+          if (receivedSize >= fileMetaData.size) {
+            // 受信完了処理：Blobに変換してダウンロードリンクを作成
+            const blob = new Blob(receivedBuffers);
+            const downloadUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = fileMetaData.name;
+            a.innerText = `📥 ${fileMetaData.name} を保存する`;
+            downloadArea.innerHTML = '';
+            downloadArea.appendChild(a);
+            statusEl.innerText = 'ステータス: ファイル受信完了';
+          }
+        }
+      };
+    }
+
+    // 受信側としてデータチャネルを受け取る処理
+    peerConnection.ondatachannel = (event) => {
+      setupDataChannel(event.channel);
+    };
+
+    // ICE候補の収集完了を待つ処理
+    function waitForIceGathering() {
+      return new Promise((resolve) => {
+        if (peerConnection.iceGatheringState === 'complete') {
+          resolve();
+        } else {
+          const checkState = () => {
+            if (peerConnection.iceGatheringState === 'complete') {
+              peerConnection.removeEventListener('icegatheringstatechange', checkState);
+              resolve();
+            }
+          };
+          peerConnection.addEventListener('icegatheringstatechange', checkState);
+        }
+      });
+    }
+
+    // 【送信側】オファー作成ボタン
+    document.getElementById('createOfferBtn').onclick = async () => {
+      const channel = peerConnection.createDataChannel('fileTransfer');
+      setupDataChannel(channel);
+
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+
+      statusEl.innerText = '接続情報を作成中(ネットワーク探索中)...';
+      await waitForIceGathering();
+
+      localSdpEl.value = JSON.stringify(peerConnection.localDescription);
+      statusEl.innerText = '生成された「自分の接続情報」をコピーして相手に渡してください';
+    };
+
+    // 接続情報を適用ボタン
+    document.getElementById('applyRemoteBtn').onclick = async () => {
+      const remoteText = remoteSdpEl.value.trim();
+      if (!remoteText) return alert('相手の接続情報を入力してください');
+
+      const remoteSdp = JSON.parse(remoteText);
+      await peerConnection.setRemoteDescription(remoteSdp);
+
+      // 相手がオファー(送信側)だった場合、受信側としてアンサーを作成
+      if (remoteSdp.type === 'offer') {
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+
+        statusEl.innerText = '応答情報を作成中...';
+        await waitForIceGathering();
+
+        localSdpEl.value = JSON.stringify(peerConnection.localDescription);
+        statusEl.innerText = '生成された「自分の接続情報」をコピーして相手(送信側)に返信してください';
+      } else {
+        statusEl.innerText = '接続設定が完了しました。接続の確立を待っています...';
+      }
+    };
+
+    // ファイル送信処理
+    sendFileBtn.onclick = () => {
+      const file = fileInput.files[0];
+      if (!file || !dataChannel) return;
+
+      // 1. ファイルのメタデータを送信
+      dataChannel.send(JSON.stringify({ name: file.name, size: file.size }));
+
+      // 2. ファイルを16KBごとに分割送信
+      const chunkSize = 16384;
+      const fileReader = new FileReader();
+      let offset = 0;
+
+      fileReader.onload = (e) => {
+        dataChannel.send(e.target.result);
+        offset += e.target.result.byteLength;
+
+        statusEl.innerText = `送信中: ${Math.round((offset / file.size) * 100)}%`;
+
+        if (offset < file.size) {
+          readNextChunk();
+        } else {
+          statusEl.innerText = 'ステータス: ファイル送信完了';
+        }
+      };
+
+      function readNextChunk() {
+        // バッファ詰まりを防止するための制御
+        if (dataChannel.bufferedAmount > 65536) {
+          setTimeout(readNextChunk, 50);
+          return;
+        }
+        const slice = file.slice(offset, offset + chunkSize);
+        fileReader.readAsArrayBuffer(slice);
+      }
+
+      readNextChunk();
+    };
+  </script>
+</body>
+</html>
